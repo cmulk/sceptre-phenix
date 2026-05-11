@@ -36,6 +36,7 @@ const (
 	responseWaitInterval   = 1 * time.Second
 	responseRegexGroupUUID = 2
 	responseRegexGroupType = 3
+	minInterfaceParts      = 2
 )
 
 // Mutex to protect minimega cc filter setting when configuring cc commands from
@@ -230,14 +231,17 @@ func (m Minimega) GetVMInfo(opts ...Option) VMs { //nolint:funlen // complex log
 		vm.CPUs, _ = strconv.Atoi(row["vcpus"])
 
 		// TODO: confirm multiple disks are separated by whitespace.
-		disk := strings.Fields(row["disks"])[0]
-		// diskspec can include multiple settings separated by comma. Path to disk
-		// will always be first setting.
-		disk = strings.Split(disk, ",")[0]
+		var disk string
+		if fields := strings.Fields(row["disks"]); len(fields) > 0 {
+			disk = fields[0]
+			// diskspec can include multiple settings separated by comma. Path to disk
+			// will always be first setting.
+			disk = strings.Split(disk, ",")[0]
+		}
 
 		snapshot, _ := strconv.ParseBool(row["snapshot"])
 
-		if snapshot {
+		if snapshot && disk != "" {
 			cmd = mmcli.NewCommand()
 			cmd.Command = "disk info " + disk
 
@@ -807,6 +811,9 @@ func (Minimega) GetExperimentCaptures(opts ...Option) []Capture {
 
 		// `interface` column will be in the form of <vm_name>:<iface_idx>
 		iface := strings.Split(row["interface"], ":")
+		if len(iface) < minInterfaceParts {
+			continue
+		}
 
 		vm := iface[0]
 		idx, _ := strconv.Atoi(iface[1])
@@ -848,11 +855,26 @@ func (m Minimega) GetClusterHosts(schedOnly bool) (Hosts, error) {
 		return []Host{}, errors.New("no cluster hosts found")
 	}
 
-	head := hosts[0]
+	var head Host
+	foundHead := false
+	headName := m.Headnode()
+
+	for _, h := range hosts {
+		if common.TrimHostnameSuffixes(h.Name) == headName {
+			head = h
+			foundHead = true
+			break
+		}
+	}
+
+	if !foundHead {
+		head = hosts[0]
+	}
 	head.Schedulable = false
 	head.Headnode = true
 
 	var cluster []Host
+	// ...
 
 	// Clear dummy namespace used for getting compute nodes in case a new compute
 	// node has been added since the last time the dummy namespace was created.
@@ -915,17 +937,19 @@ func (m Minimega) GetNamespaceHosts(ns string) (Hosts, error) {
 }
 
 func (Minimega) Headnode() string {
-	// Get headnode details
-	hosts := processNamespaceHosts("minimega")
+	if common.DeployMode == common.DeployModeAll {
+		h, err := os.Hostname()
+		if err == nil {
+			return common.TrimHostnameSuffixes(h)
+		}
+	}
 
+	// Fallback to current implementation
+	hosts := processNamespaceHosts("minimega")
 	if len(hosts) == 0 {
 		return "" // ???
 	}
-
 	headnode := hosts[0].Name
-
-	// Trim host name suffixes (like -minimega, or -phenix) potentially added to
-	// Docker containers by Docker Compose config.
 	return common.TrimHostnameSuffixes(headnode)
 }
 
@@ -933,8 +957,12 @@ func (m Minimega) IsHeadnode(node string) bool {
 	// Trim node name suffixes (like -minimega, or -phenix) potentially added to
 	// Docker containers by Docker Compose config.
 	node = common.TrimHostnameSuffixes(node)
+	head := m.Headnode()
 
-	return node == m.Headnode()
+	result := node == head
+	plog.Debug(plog.TypeSystem, "checking if host is headnode", "host", node, "headnode", head, "isHeadnode", result)
+
+	return result
 }
 
 func (m Minimega) GetMMArgs() (map[string]string, error) {
@@ -963,7 +991,15 @@ func (Minimega) GetVLANs(opts ...Option) (map[string]int, error) {
 	for _, row := range status {
 		alias := row["alias"]
 
-		id, err := strconv.Atoi(row["vlan"])
+		val := row["vlan"]
+		// If minimega returns a formatted string like "[OT (101)]", extract the number.
+		if strings.Contains(val, "(") && strings.Contains(val, ")") {
+			start := strings.Index(val, "(") + 1
+			end := strings.Index(val, ")")
+			val = val[start:end]
+		}
+
+		id, err := strconv.Atoi(val)
 		if err != nil {
 			return nil, fmt.Errorf("converting VLAN ID to integer: %w", err)
 		}
